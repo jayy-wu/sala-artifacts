@@ -91,10 +91,14 @@ def run_test(bm, bn, bk, stages):
     )
     torch.cuda.synchronize()
 
-    ref = torch.mm(a, b.T)
-    err = (c - ref).abs().max().item() / ref.abs().max().item()
-    ok = err < 0.05
-    print(f"Correctness: rel_err={err:.6f} ({'PASS' if ok else 'FAIL'})")
+    # fp32 reference: compute the product in float32 so the comparison is
+    # against a higher-precision reference, not against an fp16 product.
+    ref = torch.mm(a.float(), b.float().t())
+    err = (c.float() - ref).abs().max().item() / ref.abs().max().item()
+    nonfinite = int((~torch.isfinite(c)).sum().item())
+    ok = (err < 0.05) and nonfinite == 0
+    print(f"Correctness (fp32 reference): rel_err={err:.6f}, "
+          f"non-finite={nonfinite} ({'PASS' if ok else 'FAIL'})")
     return ok
 
 

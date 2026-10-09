@@ -1,0 +1,8 @@
+# Dependencies for the Tawa rows (benchmarks/tawa/*.py).
+#
+# Verified during artifact evaluation with torch 2.14.0 and numpy 2.x on CUDA 13.0
+# (H100 / H800).  The scripts use only randn/mm/softmax/empty, so the ranges
+# below keep them runnable on newer releases; the Triton fork is installed
+# separately (see README section 2.4) and pins its own build dependencies.
+torch>=2.4,<3
+numpy>=1.26,<3

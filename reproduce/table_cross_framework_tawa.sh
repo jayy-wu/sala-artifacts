@@ -63,7 +63,7 @@ fi
 "$PY" -c "import triton" >/dev/null 2>&1 || {
     echo "ERROR: triton cannot be imported. Build the fork:"
     echo "       cd $TRITON_AREF && pip install .   # builds the fork"; exit 1; }
-"$PY" -c "import triton; assert triton.__version__ == '3.3.0'" 2>/dev/null || {
+"$PY" -c "import triton; assert triton.__version__.split('+')[0] == '3.3.0'" 2>/dev/null || {
     echo "ERROR: installed triton is not the aref fork (3.3.0)."
     echo "       cd $TRITON_AREF && pip install .   # builds the fork"; exit 1; }
 grep -q 'SALA_ENABLE' "$TRITON_AREF/lib/Analysis/Allocation.cpp" || {

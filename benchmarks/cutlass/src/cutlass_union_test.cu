@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <string>
+#include <vector>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -81,6 +82,88 @@ constexpr bool kUnionBuild = true;
 constexpr bool kUnionBuild = false;
 #endif
 
+// Sampled fp32 reference verdict.
+struct RefVerdict {
+    float max_abs = 0.0f;   // largest |D - D_ref| over the sampled elements
+    int   n_bad = 0;        // samples outside tolerance, or non-finite
+    int   n_nonfinite = 0;  // non-finite sampled outputs (NaN/Inf)
+};
+
+// The comparison must reject non-finite values explicitly: NaN/Inf comparisons
+// are unordered, so a bare `diff > tol` test silently accepts them.
+static RefVerdict reference_check(const cutlass::half_t* h_A,
+                                  const cutlass::half_t* h_B,
+                                  const cutlass::half_t* h_D,
+                                  int M, int N, int K, size_t elems_CD,
+                                  size_t nsamp) {
+    RefVerdict v;
+    for (size_t s = 0; s < nsamp; s++) {
+        size_t idx = (s * 7919 + 13) % elems_CD;
+        size_t m = idx % (size_t)M, n = idx / (size_t)M;
+        float ref = 0.0f;
+        for (int k = 0; k < K; k++)
+            ref += float(h_A[(size_t)m * K + k]) * float(h_B[(size_t)n * K + k]);
+        float got = float(h_D[idx]);
+        if (!std::isfinite(got) || !std::isfinite(ref)) {
+            v.n_nonfinite++; v.n_bad++;
+            continue;
+        }
+        float ae = fabsf(got - ref);
+        if (ae > v.max_abs) v.max_abs = ae;
+        if (ae > 0.1f + 0.01f * fabsf(ref)) v.n_bad++;
+    }
+    return v;
+}
+
+// Self-test of the checker itself: a checker that cannot fail is worthless, so
+// we feed it outputs we know are wrong and require it to reject each. Runs on
+// the host only (no GPU needed); exit status 0 = all negative tests rejected.
+static int selftest() {
+    printf("================================================\n");
+    printf("Checker self-test (negative tests, host-only)\n");
+    printf("================================================\n");
+    const int M = 64, N = 64, K = 32;
+    const size_t eA = (size_t)M * K, eB = (size_t)N * K, eD = (size_t)M * N;
+    std::vector<cutlass::half_t> A(eA), B(eB), D(eD);
+    srand(42);
+    for (auto& x : A) x = cutlass::half_t(float(rand() % 10 - 5) / 10.0f);
+    for (auto& x : B) x = cutlass::half_t(float(rand() % 10 - 5) / 10.0f);
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            float r = 0.0f;
+            for (int k = 0; k < K; k++)
+                r += float(A[(size_t)m * K + k]) * float(B[(size_t)n * K + k]);
+            D[m + (size_t)n * M] = cutlass::half_t(r);
+        }
+
+    int failures = 0;
+    auto report = [&](const char* what, RefVerdict v, bool expect_reject) {
+        bool rejected = (v.n_bad > 0);
+        printf("  %-22s max|D-Dref|=%-9.4f bad=%-4d non-finite=%-3d -> %-6s (expected %s)\n",
+               what, v.max_abs, v.n_bad, v.n_nonfinite,
+               rejected ? "REJECT" : "accept", expect_reject ? "REJECT" : "accept");
+        if (rejected != expect_reject) failures++;
+    };
+
+    report("clean output", reference_check(A.data(), B.data(), D.data(), M, N, K, eD, eD), false);
+
+    std::vector<cutlass::half_t> Dnan = D;
+    Dnan[(0 * 7919 + 13) % eD] = cutlass::half_t(NAN);
+    report("NaN injected", reference_check(A.data(), B.data(), Dnan.data(), M, N, K, eD, eD), true);
+
+    std::vector<cutlass::half_t> Dinf = D;
+    Dinf[(1 * 7919 + 13) % eD] = cutlass::half_t(INFINITY);
+    report("Inf injected", reference_check(A.data(), B.data(), Dinf.data(), M, N, K, eD, eD), true);
+
+    std::vector<cutlass::half_t> Dbig = D;
+    size_t big = (2 * 7919 + 13) % eD;
+    Dbig[big] = cutlass::half_t(float(Dbig[big]) + 100.0f);
+    report("large finite error", reference_check(A.data(), B.data(), Dbig.data(), M, N, K, eD, eD), true);
+
+    printf("\nSelf-test: %s\n", failures ? "FAILED" : "all negative tests rejected as required");
+    return failures ? 1 : 0;
+}
+
 template <typename GK>
 bool run_gemm(int M, int N, int K, bool verify = true, const char* why = nullptr) {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GK>;
@@ -137,10 +220,11 @@ bool run_gemm(int M, int N, int K, bool verify = true, const char* why = nullptr
 
     auto* h_D = new cutlass::half_t[elems_CD];
     cudaMemcpy(h_D, d_D, elems_CD * 2, cudaMemcpyDeviceToHost);
-    float sum = 0; int nonzero = 0;
+    float sum = 0; int nonzero = 0; int n_nonfinite_out = 0;
     for (size_t i = 0; i < elems_CD; i++) {
         float v = float(h_D[i]); sum += v;
         if (v != 0.0f) nonzero++;
+        if (!std::isfinite(v)) n_nonfinite_out++;
     }
 
     // Numerical reference: sampled fp32 dot products from the same fp16 inputs.
@@ -150,7 +234,8 @@ bool run_gemm(int M, int N, int K, bool verify = true, const char* why = nullptr
     //   A (M,K) row-major    -> element (m,k) at m*K + k
     //   B (N,K)              -> element (n,k) at n*K + k
     if (!verify) {
-        printf("  GEMM: sum=%.2f nonzero=%d/%zu\n", sum, nonzero, elems_CD);
+        printf("  GEMM: sum=%.2f nonzero=%d/%zu non-finite=%d\n",
+               sum, nonzero, elems_CD, n_nonfinite_out);
         printf("  Reference: NOT CHECKED here (%s)\n", why ? why : "not requested");
         delete[] h_A; delete[] h_B; delete[] h_D;
         cudaFree(d_A); cudaFree(d_B); cudaFree(d_C); cudaFree(d_D);
@@ -158,24 +243,12 @@ bool run_gemm(int M, int N, int K, bool verify = true, const char* why = nullptr
         return ok;
     }
 
-    const size_t NSAMP = 4096;
-    float max_abs = 0.0f;
-    int   n_bad = 0;
-    for (size_t s = 0; s < NSAMP; s++) {
-        size_t idx = (s * 7919 + 13) % elems_CD;
-        size_t m = idx % (size_t)M, n = idx / (size_t)M;
-        float ref = 0.0f;
-        for (int k = 0; k < K; k++)
-            ref += float(h_A[(size_t)m * K + k]) * float(h_B[(size_t)n * K + k]);
-        float got = float(h_D[idx]);
-        float ae = fabsf(got - ref);
-        if (ae > max_abs) max_abs = ae;
-        if (ae > 0.1f + 0.01f * fabsf(ref)) n_bad++;
-    }
-    bool numeric_ok = (n_bad == 0);
-    printf("  GEMM: sum=%.2f nonzero=%d/%zu\n", sum, nonzero, elems_CD);
-    printf("  Reference: %zu samples, max|D-Dref|=%.4f, %d bad %s\n",
-           NSAMP, max_abs, n_bad, numeric_ok ? "PASS" : "FAIL");
+    RefVerdict v = reference_check(h_A, h_B, h_D, M, N, K, elems_CD, 4096);
+    bool numeric_ok = (v.n_bad == 0) && (n_nonfinite_out == 0);
+    printf("  GEMM: sum=%.2f nonzero=%d/%zu non-finite=%d\n",
+           sum, nonzero, elems_CD, n_nonfinite_out);
+    printf("  Reference: 4096 samples, max|D-Dref|=%.4f, %d bad, %d non-finite %s\n",
+           v.max_abs, v.n_bad, v.n_nonfinite, numeric_ok ? "PASS" : "FAIL");
     printf("  Result: %s\n", (ok && numeric_ok) ? "PASS" : "FAIL");
     bool pass = ok && numeric_ok;
 
@@ -315,6 +388,7 @@ bool safe_regime(int M, int N, int sm_count) {
 int main(int argc, char** argv) {
     bool check_only = false;
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--selftest") return selftest();
         if (std::string(argv[i]) == "--check") check_only = true;
     }
 
@@ -352,6 +426,18 @@ int main(int argc, char** argv) {
         np_fail += !nonpersistent_check<T128, 3>("128x128x64, 3-stage", 2048, 2048, 2048);
         np_fail += !nonpersistent_check<T256, 2>("128x256x64, 2-stage", 2048, 2048, 2048);
         printf("\nNon-persistent: %d/3 configurations verified.\n", 3 - np_fail);
+
+        printf("\nSummary (checked vs skipped):\n");
+        if (kUnionBuild) {
+            printf("  checked:  5/5 persistent-union configs, single-tile regime (1024^2: one work tile/CTA)\n");
+            printf("            3/3 non-persistent configs at 2048^3\n");
+            printf("  skipped:  the persistent union at 2048^3 -- multi-tile assignment; not a valid\n");
+            printf("            overlap without producer-side gating (prints NOT CHECKED there; README 2.3)\n");
+        } else {
+            printf("  checked:  5/5 configs at 2048^3\n");
+            printf("            3/3 non-persistent configs at 2048^3\n");
+            printf("  skipped:  none\n");
+        }
 
         return (failures || np_fail) ? 1 : 0;
     }

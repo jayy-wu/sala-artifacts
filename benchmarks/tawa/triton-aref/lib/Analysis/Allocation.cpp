@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <string>
 
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -18,6 +19,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "allocation-shared-memory"
@@ -831,6 +833,26 @@ private:
                  << "% reduction)\n";
   }
 
+  /// SALA: total threads in the CTA, derived from the warp-group layout
+  /// (max start_warp + num_warps over the module's ttng.warp_group ops), or
+  /// -1 when the module has no warp groups.  This is the quantity the
+  /// cross-tile barrier's arrival count must equal, so it is what the
+  /// geometry guard below checks.
+  int salaCtaThreads(Operation *op) {
+    auto mod = op->getParentOfType<ModuleOp>();
+    if (!mod)
+      return -1;
+    int warps = 0;
+    bool found = false;
+    mod->walk([&](nvidia_gpu::WarpGroupOp wg) {
+      found = true;
+      int end = static_cast<int>(wg.getStartWarp()) +
+                static_cast<int>(wg.getNumWarps());
+      warps = std::max(warps, end);
+    });
+    return found ? warps * 32 : -1;
+  }
+
   /// SALA: insert cross-tile synchronization for persistent kernels.
   /// Only the TMA load group gets bar.sync; the MMA group proceeds freely.
   /// Correctness relies on the aref protocol's within-tile barriers: the TMA
@@ -854,6 +876,24 @@ private:
       if (!hasNestedFor)
         return;
 
+      // Hard guard: the barrier must be reached by every thread of the CTA, and
+      // this prototype only models the 2 x 128-thread geometry.  Any other warp
+      // count leaves the barrier half-reached (the kernel deadlocks), so an
+      // unsupported geometry is rejected here instead of being compiled.
+      int threads = salaCtaThreads(forOp);
+      if (threads != 256) {
+        std::string got =
+            threads > 0 ? ("has " + std::to_string(threads) + " threads")
+                        : std::string("has an unknown thread count");
+        llvm::report_fatal_error(
+            llvm::Twine(
+                "SALA: unsupported warp geometry for the cross-tile barrier. "
+                "The prototype supports 256-thread kernels (num_warps=4, two "
+                "warp groups of 128 threads); this kernel ") +
+            llvm::Twine(got) +
+            ". Recompile with num_warps=4, or disable SALA (SALA_ENABLE=0).");
+      }
+
       auto loc = forOp.getLoc();
       OpBuilder builder(forOp.getContext());
       auto i32Ty = builder.getIntegerType(32);
@@ -863,7 +903,7 @@ private:
       builder.setInsertionPoint(&yieldOp);
       auto barId = builder.create<arith::ConstantIntOp>(loc, 3, i32Ty);
       auto numThreads =
-          builder.create<arith::ConstantIntOp>(loc, 256, i32Ty);
+          builder.create<arith::ConstantIntOp>(loc, threads, i32Ty);
       builder.create<NVVM::BarrierOp>(loc, barId, numThreads);
     });
   }

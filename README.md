@@ -254,7 +254,7 @@ configurations in both builds.
 ### 2.4 Tawa rows (own toolchain, Python 3.10, ~30 min incl. setup)
 
 ```bash
-pip install torch numpy                                    # one-time (~2.5 GB)
+pip install -r benchmarks/tawa/requirements.txt            # one-time (~2.5 GB)
 cd benchmarks/tawa/triton-aref && pip install . && cd -   # one-time
 GPU=0 bash reproduce/table_cross_framework_tawa.sh
 ```
@@ -300,9 +300,10 @@ matter if you reuse it:
   recognizes (`WarpGroupOp > for > for`, i.e. the GEMM kernels), and the
   thread count it emits assumes the 2 × 128-thread warp-group split — the
   `num_warps=4` used by the rows above. Any other `num_warps` (2, 8, …)
-  leaves the barrier incomplete and the kernel **hangs**; recompile the
-  fork for your warp count (or use the production analysis) before
-  reusing those kernels with different geometry.
+  would leave the barrier half-reached (the kernel deadlocks), so the
+  pass now **rejects an unsupported geometry at compile time** with an
+  explicit error rather than emitting a broken barrier — use
+  `num_warps=4`, or the production analysis, for other geometries.
 - The FMHA kernel's cross-tile synchronization comes from the kernel's
   own mbarrier protocol (`--membar 1`), not from the pass — see above.
   The pass inserts nothing for that loop shape, and the analysis does not
@@ -312,6 +313,13 @@ matter if you reuse it:
 `SALA_NO_BARRIER=1` disables the inserted barrier. It is a diagnostic
 switch that deliberately produces unsound kernels (it is how the FMHA
 hazard above was demonstrated) — do not use it for measurements.
+
+The supported Tawa path is the two scripts under `benchmarks/tawa/`:
+they carry the reference checks and the cross-tile synchronization. The
+compiler submodule also ships internal evaluation scripts
+(`croqtile/tools/sala_real_eval/`); several of them predate the
+cross-tile sync and are **not** suitable for three-stage kernels — use
+the scripts above.
 
 The script also checks the FMHA outputs against a **fp32 torch causal
 reference** (2 % + 2 % tolerance, `--check`) for both stages and both
@@ -338,6 +346,14 @@ limits, and the ncu-measured **Act. column**
 Occupancy follows: 1P1C 4s 1→2 CTAs/SM (smem-bound), 1P1C 3s 2→3,
 1P2C/1P3C register-bound at 1 CTA/SM, FA register-bound at 1 CTA/SM —
 all as in the paper's table.
+
+Two occupancy *limits* are reported separately, because they differ where
+registers bind: for SALA 1P2C/1P3C the shared-memory capacity allows
+2 CTAs/SM while the register limit still allows only 1. The achieved
+occupancy is the binding minimum (1, matching ncu's reported value); the
+paper's Table 3 lists both limits with the binding one in bold, so a
+column reading `smem_occ=2` next to `reg_occ=1` means SMEM stopped being
+the constraint — not that 2 CTAs are resident.
 
 The Act. column was re-measured during artifact evaluation and the
 paper's Table 3 carries the measured values (marked orange in the
@@ -504,7 +520,7 @@ explicitly rather than printing a blanket verdict:
 - **Tawa prototype scope**: the vendored pass is a prototype of the
   interference refinement (`~50 LOC`), not the production analysis; its
   inserted cross-tile barrier covers the GEMM loop shapes at
-  `num_warps=4` (other warp counts hang — recompile for your geometry),
+  `num_warps=4` (other warp counts are rejected at compile time),
   and the FMHA row's synchronization comes from the kernel's mbarrier
   protocol (`--membar 1`). See §2.4.
 - **Tawa rows**: SMEM measurements via `ncu`. The **FMHA** outputs are
@@ -523,20 +539,24 @@ measurements are H800-only. Two Table-3 / Figure-3 quantities are
 machine-sensitive, and the artifact documents them so a reviewer on an
 H100 can interpret their own numbers:
 
-- **Act. (`sm__warps_active`) for 1P1C-3s**: 14.2→20.4 % on the H800;
-  H100 measurements reported to us are ≈17.2–17.6 % for the SALA side.
-  The direction and the occupancy step (2→3 CTAs/SM) are what the
-  claim rests on; the absolute warp-active percentage depends on the
-  SM's warp-slot budget and clock behaviour.
-- **Figure-3 ratio for 1P1C-3s**: flat-to-slightly-regressed on H100s
-  (±~5 %), occupancy/machine-dependent. On our H800 it is ~1.00×
-  (repeated runs of the shipped script give 0.99–1.04×); H100
-  measurements reported to us range from a mild regression
-  (0.95–0.96×) to a ~1.10× gain — treat this row as flat, not as a
-  gain. The occupancy step (2→3 CTAs/SM: 91.1→74.8 KB against
-  228 KB/SM, registers permitting 3) reproduces on both parts. The
-  1P1C-4s rows (1.34–1.40×) are the headline gains and reproduce on
-  both.
+- **Act. (`sm__warps_active`) for 1P1C-3s**: 14.2→20.4 % on our H800
+  (PCIe). Reported SALA-side values span ≈17.2–20.4 % across parts —
+  e.g. 20.4 % on an H100 PCIe (matching ours) and ≈17.2 % on an H800
+  NVL — so the absolute percentage tracks the part's power/clock
+  budget rather than a clean H100-vs-H800 split. The direction and the
+  occupancy step (2→3 CTAs/SM) are what the claim rests on, and they
+  reproduce everywhere.
+- **Figure-3 ratio for 1P1C-3s**: flat-to-slightly-regressed,
+  occupancy/machine-dependent — treat this row as flat, not as a gain.
+  Our H800 runs give 0.99–1.04× (the paper's measurement: 0.99×), and
+  every H100 measurement reproducible from the reports matches that
+  picture: 0.95–0.96×, 0.9514×, 0.957× (132-SM SXM), 1.011× (114-SM
+  PCIe). One early report of a ~1.10× H100 gain has not been reproduced
+  by us or by later evaluation, and we cannot reconstruct its
+  configuration, so we no longer cite it. The occupancy step (2→3
+  CTAs/SM: 91.1→74.8 KB against 228 KB/SM, registers permitting 3)
+  reproduces on every part. The 1P1C-4s rows (1.34–1.40×) are the
+  headline gains and reproduce on both.
 
 ### 6.5 Measurement methodology (trials, order, variability)
 

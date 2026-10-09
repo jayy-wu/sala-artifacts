@@ -101,15 +101,23 @@ echo "Paper values are these ncu measurements rounded to whole KB."
 # (see the README section 2.3).  So the union is verified at 1024^2, where
 # every CTA gets one work tile, and the 2048^3 union run reports NOT CHECKED.
 echo ""
-echo "[4/4] numerical verification (sampled fp32 reference, 4096 samples):"
+echo "[4/5] checker self-test (negative tests: NaN / Inf / large error must be rejected)"
+"$WORK/cutlass_union_test_baseline" --selftest || { echo "ERROR: the reference checker failed its own negative tests"; exit 1; }
+
+echo ""
+echo "[5/5] numerical verification (sampled fp32 reference, 4096 samples):"
 echo "--- baseline (struct) ---"
-"$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped"
+"$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped|checked:|skipped:"
 b_rc=${PIPESTATUS[0]}
 echo "--- SALA (struct->union) ---"
-"$WORK/cutlass_union_test_sala" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped"
+"$WORK/cutlass_union_test_sala" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped|checked:|skipped:"
 s_rc=${PIPESTATUS[0]}
 if [[ $b_rc -ne 0 || $s_rc -ne 0 ]]; then
     echo "ERROR: numerical verification failed (baseline rc=$b_rc, union rc=$s_rc)"
     exit 1
 fi
-echo "Both builds numerically verified."
+echo "Both builds numerically verified (self-test included)."
+echo "Scope: baseline 5/5 at 2048^3 + 3/3 non-persistent; union 5/5 in the single-tile"
+echo "regime (1024^2) + 3/3 non-persistent. The persistent union at 2048^3 is NOT"
+echo "checked by design -- multi-tile assignment without producer-side gating is not"
+echo "a valid overlap (README 2.3); those rows are SMEM measurements, not timings."
